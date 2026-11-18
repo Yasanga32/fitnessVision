@@ -20,8 +20,10 @@ from mediapipe.tasks.python import vision
 
 from angles import (
     LEFT_ELBOW_JOINT,
+    LEFT_HIP_JOINT,
     LEFT_KNEE_JOINT,
     RIGHT_ELBOW_JOINT,
+    RIGHT_HIP_JOINT,
     RIGHT_KNEE_JOINT,
     evaluate_elbow_reliability,
     get_joint_angle,
@@ -69,10 +71,12 @@ ELBOW_JOINTS = (
     ("R", RIGHT_ELBOW_JOINT, LEFT_ELBOW_JOINT, False),
 )
 
-# Knee configurations: (short_label, joint_triplet, align_right_of_joint)
-KNEE_JOINTS = (
-    ("L", LEFT_KNEE_JOINT, True),
-    ("R", RIGHT_KNEE_JOINT, False),
+# Hip and knee configurations: (label_prefix, joint_triplet, align_right_of_joint)
+LOWER_BODY_JOINTS = (
+    ("L-Hip", LEFT_HIP_JOINT, True),
+    ("R-Hip", RIGHT_HIP_JOINT, False),
+    ("L-Knee", LEFT_KNEE_JOINT, True),
+    ("R-Knee", RIGHT_KNEE_JOINT, False),
 )
 
 
@@ -439,23 +443,23 @@ try:
                             placed_boxes,
                         )
 
-                # Calculate and display both Left (23-25-27) and Right (24-26-28)
-                # knee angles using the shared `get_joint_angle()` helper.
-                for side, joint_triplet, align_right in KNEE_JOINTS:
-                    knee_data = get_joint_angle(
+                # Calculate and display Left/Right Hip (11-23-25, 12-24-26) and
+                # Left/Right Knee (23-25-27, 24-26-28) angles via `get_joint_angle()`.
+                for label_prefix, joint_triplet, align_right in LOWER_BODY_JOINTS:
+                    joint_data = get_joint_angle(
                         pose,
                         joint_triplet,
                         width,
                         height,
                         min_visibility=0.5,
                     )
-                    if knee_data is not None:
-                        knee_angle, knee_px = knee_data
-                        label = f"{side}-Knee: {int(round(knee_angle))} deg"
+                    if joint_data is not None:
+                        joint_angle, joint_px = joint_data
+                        label = f"{label_prefix}: {int(round(joint_angle))} deg"
                         draw_angle_label(
                             frame,
                             label,
-                            knee_px,
+                            joint_px,
                             True,
                             align_right,
                             placed_boxes,
