@@ -2,7 +2,7 @@
 Reusable 2D joint angle calculation and reliability diagnostics for MediaPipe
 Pose landmarks.
 
-Designed to be extended easily to other joints (e.g., right elbow, knees, hips)
+Designed to be extended easily to other joints (elbows, hips, knees, etc.)
 by passing any `(point_a, point_b, point_c)` landmark index triplet.
 """
 
@@ -40,15 +40,19 @@ RIGHT_KNEE_JOINT = (RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
 
 
 @dataclass
-class ElbowReliability:
-    """Diagnostic summary describing whether a 2D elbow angle is reliable."""
+class JointReliability:
+    """Diagnostic summary describing whether a 2D joint angle is reliable."""
 
     is_reliable: bool
     reasons: List[str]
-    shoulder_dist_px: float
-    elbow_dist_px: float
-    upper_arm_px: float
-    forearm_px: float
+    proximal_dist_px: float
+    vertex_dist_px: float
+    upper_seg_px: float
+    lower_seg_px: float
+
+
+# Backward-compatible alias for earlier code referencing ElbowReliability
+ElbowReliability = JointReliability
 
 
 def calculate_angle(point_a: Point2D, point_b: Point2D, point_c: Point2D) -> float:
@@ -82,6 +86,11 @@ def calculate_angle(point_a: Point2D, point_b: Point2D, point_c: Point2D) -> flo
     return math.degrees(math.acos(cos_angle))
 
 
+def is_landmark_in_frame(landmark, margin: float = 0.0) -> bool:
+    """Return True if a landmark's normalized (x, y) lies inside the camera frame."""
+    return (-margin <= landmark.x <= 1.0 + margin) and (-margin <= landmark.y <= 1.0 + margin)
+
+
 def get_joint_angle(
     pose: Sequence,
     joint_indices: Tuple[int, int, int],
@@ -91,7 +100,8 @@ def get_joint_angle(
 ) -> Optional[Tuple[float, Tuple[int, int]]]:
     """
     Compute a 2D joint angle in degrees from pixel-scaled MediaPipe landmarks,
-    only when all three landmarks meet the visibility threshold.
+    only when all three landmarks are present, inside the frame, and meet
+    the visibility threshold.
 
     Args:
         pose: Sequence of 33 MediaPipe pose landmarks.
@@ -102,7 +112,7 @@ def get_joint_angle(
 
     Returns:
         (angle_degrees, (vertex_x, vertex_y)) if all three landmarks are
-        sufficiently visible, otherwise None.
+        sufficiently visible and in frame, otherwise None.
     """
     idx_a, idx_b, idx_c = joint_indices
     lm_a, lm_b, lm_c = pose[idx_a], pose[idx_b], pose[idx_c]
@@ -110,6 +120,8 @@ def get_joint_angle(
     for lm in (lm_a, lm_b, lm_c):
         visibility = getattr(lm, "visibility", None)
         if visibility is None or visibility < min_visibility:
+            return None
+        if not is_landmark_in_frame(lm):
             return None
 
     # Scale normalized coordinates [0.0, 1.0] into pixel space so aspect ratio
@@ -127,7 +139,7 @@ def get_joint_visibilities(
     pose: Sequence,
     joint_indices: Tuple[int, int, int],
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Return the visibility scores for a (shoulder, elbow, wrist) triplet."""
+    """Return the visibility scores for a (proximal, vertex, distal) triplet."""
     idx_a, idx_b, idx_c = joint_indices
     return (
         getattr(pose[idx_a], "visibility", None),
@@ -136,23 +148,32 @@ def get_joint_visibilities(
     )
 
 
-def evaluate_elbow_reliability(
+def evaluate_joint_reliability(
     pose: Sequence,
     selected_joint: Tuple[int, int, int],
     opposite_joint: Tuple[int, int, int],
     frame_width: int,
     frame_height: int,
     min_visibility: float = 0.5,
-    overlap_width_ratio: float = 0.06,
+    overlap_width_ratio: float = 0.05,
+    side_profile_width_ratio: float = 0.06,
     min_bone_width_ratio: float = 0.03,
-) -> ElbowReliability:
+) -> JointReliability:
     """
-    Check whether the selected elbow's 2D angle is reliable, flagging low
-    visibility, left/right landmark overlap in side views, far-side occlusion,
-    and severe 2D foreshortening.
+    Evaluate whether a 2D joint angle measurement is reliable.
+
+    Visibility alone does not guarantee accuracy in a monocular camera, so this
+    combines multiple independent signals:
+    1. All three required landmarks meet `min_visibility`.
+    2. All three landmarks lie inside the visible frame (no off-screen guesses).
+    3. The selected joint vertex does not directly overlap its opposite-side
+       counterpart in 2D pixel space.
+    4. In a side-facing profile (proximal pair collapsed in 2D), the selected
+       side is not the occluded far side (lower visibility or deeper `z`).
+    5. Neither adjacent limb segment is severely foreshortened in 2D.
     """
-    sel_sh, sel_el, sel_wr = (pose[i] for i in selected_joint)
-    opp_sh, opp_el, opp_wr = (pose[i] for i in opposite_joint)
+    sel_a, sel_b, sel_c = (pose[i] for i in selected_joint)
+    opp_a, opp_b, opp_c = (pose[i] for i in opposite_joint)
 
     def to_px(lm) -> Point2D:
         return (lm.x * frame_width, lm.y * frame_height)
@@ -161,50 +182,57 @@ def evaluate_elbow_reliability(
         p1, p2 = to_px(lm1), to_px(lm2)
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-    shoulder_dist_px = dist_px(sel_sh, opp_sh)
-    elbow_dist_px = dist_px(sel_el, opp_el)
-    upper_arm_px = dist_px(sel_sh, sel_el)
-    forearm_px = dist_px(sel_el, sel_wr)
+    proximal_dist_px = dist_px(sel_a, opp_a)
+    vertex_dist_px = dist_px(sel_b, opp_b)
+    upper_seg_px = dist_px(sel_a, sel_b)
+    lower_seg_px = dist_px(sel_b, sel_c)
 
     overlap_threshold_px = frame_width * overlap_width_ratio
+    side_profile_threshold_px = frame_width * side_profile_width_ratio
     min_bone_px = frame_width * min_bone_width_ratio
 
     reasons: List[str] = []
 
-    # 1. Missing or low-confidence landmarks on the selected arm
-    sel_vis = [getattr(lm, "visibility", None) for lm in (sel_sh, sel_el, sel_wr)]
+    # 1. Missing or low-confidence landmarks on the selected joint
+    sel_vis = [getattr(lm, "visibility", None) for lm in (sel_a, sel_b, sel_c)]
     if any(v is None or v < min_visibility for v in sel_vis):
         reasons.append("low visibility")
 
-    # 2. Left and right elbows projecting onto nearly the same 2D point
-    if elbow_dist_px < overlap_threshold_px:
-        reasons.append("L/R elbow overlap")
+    # 2. Extrapolated landmarks outside the camera frame
+    if any(not is_landmark_in_frame(lm) for lm in (sel_a, sel_b, sel_c)):
+        reasons.append("out of frame")
 
-    # 3. Side-facing torso profile where left and right shoulders overlap
-    if shoulder_dist_px < overlap_threshold_px:
-        opp_vis = [getattr(lm, "visibility", None) for lm in (opp_sh, opp_el, opp_wr)]
+    # 3. Direct 2D overlap between left and right joint vertices
+    if vertex_dist_px < overlap_threshold_px:
+        reasons.append("L/R overlap")
+
+    # 4. Side-facing profile: flag the occluded far side behind the torso
+    if proximal_dist_px < side_profile_threshold_px:
+        opp_vis = [getattr(lm, "visibility", None) for lm in (opp_a, opp_b, opp_c)]
         sel_avg_vis = sum(v for v in sel_vis if v is not None) / 3.0
         opp_avg_vis = sum(v for v in opp_vis if v is not None) / 3.0
 
-        sel_z = getattr(sel_el, "z", None)
-        opp_z = getattr(opp_el, "z", None)
+        sel_z = getattr(sel_b, "z", None)
+        opp_z = getattr(opp_b, "z", None)
         is_farther = (
             sel_z is not None and opp_z is not None and (sel_z - opp_z) > 0.05
         )
         if opp_avg_vis - sel_avg_vis > 0.1 or is_farther:
             reasons.append("far-side occluded")
-        else:
-            reasons.append("side-view overlap")
 
-    # 4. Arm pointing nearly straight at/away from camera (2D foreshortening)
-    if upper_arm_px < min_bone_px or forearm_px < min_bone_px:
-        reasons.append("foreshortened arm")
+    # 5. Severe 2D foreshortening (limb pointing toward/away from camera)
+    if upper_seg_px < min_bone_px or lower_seg_px < min_bone_px:
+        reasons.append("foreshortened")
 
-    return ElbowReliability(
+    return JointReliability(
         is_reliable=len(reasons) == 0,
         reasons=reasons,
-        shoulder_dist_px=shoulder_dist_px,
-        elbow_dist_px=elbow_dist_px,
-        upper_arm_px=upper_arm_px,
-        forearm_px=forearm_px,
+        proximal_dist_px=proximal_dist_px,
+        vertex_dist_px=vertex_dist_px,
+        upper_seg_px=upper_seg_px,
+        lower_seg_px=lower_seg_px,
     )
+
+
+# Backward-compatible alias
+evaluate_elbow_reliability = evaluate_joint_reliability

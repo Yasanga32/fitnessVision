@@ -25,10 +25,12 @@ from angles import (
     RIGHT_ELBOW_JOINT,
     RIGHT_HIP_JOINT,
     RIGHT_KNEE_JOINT,
-    evaluate_elbow_reliability,
+    evaluate_joint_reliability,
     get_joint_angle,
     get_joint_visibilities,
 )
+from smoothing import AngleSmoother
+from squat_stage import SquatStage, SquatStageDetector
 
 # Temporary debug flag for side-view overlap investigation (press 'D' to toggle live)
 DEBUG_SIDE_VIEW = True
@@ -65,18 +67,14 @@ def get_connection_color(start_idx: int, end_idx: int, debug_mode: bool):
     return COLOR_CENTER
 
 
-# Elbow configurations: (short_label, joint_triplet, opposite_triplet, align_right_of_joint)
-ELBOW_JOINTS = (
-    ("L", LEFT_ELBOW_JOINT, RIGHT_ELBOW_JOINT, True),
-    ("R", RIGHT_ELBOW_JOINT, LEFT_ELBOW_JOINT, False),
-)
-
-# Hip and knee configurations: (label_prefix, joint_triplet, align_right_of_joint)
-LOWER_BODY_JOINTS = (
-    ("L-Hip", LEFT_HIP_JOINT, True),
-    ("R-Hip", RIGHT_HIP_JOINT, False),
-    ("L-Knee", LEFT_KNEE_JOINT, True),
-    ("R-Knee", RIGHT_KNEE_JOINT, False),
+# All tracked joints: (label_prefix, joint_triplet, opposite_triplet, align_right_of_joint)
+TRACKED_JOINTS = (
+    ("L-Elb", LEFT_ELBOW_JOINT, RIGHT_ELBOW_JOINT, True),
+    ("R-Elb", RIGHT_ELBOW_JOINT, LEFT_ELBOW_JOINT, False),
+    ("L-Hip", LEFT_HIP_JOINT, RIGHT_HIP_JOINT, True),
+    ("R-Hip", RIGHT_HIP_JOINT, LEFT_HIP_JOINT, False),
+    ("L-Knee", LEFT_KNEE_JOINT, RIGHT_KNEE_JOINT, True),
+    ("R-Knee", RIGHT_KNEE_JOINT, LEFT_KNEE_JOINT, False),
 )
 
 
@@ -179,43 +177,52 @@ def draw_angle_label(
     )
 
 
-def format_elbow_status(side: str, angle, reliability):
-    """Build a (text, bgr_color) tuple for one elbow in the debug HUD."""
-    if reliability.is_reliable and angle is not None:
-        return (f"{side}-Elbow: RELIABLE ({int(round(angle))} deg)", (0, 255, 0))
-    reason_str = ", ".join(reliability.reasons) if reliability.reasons else "unavailable"
-    return (f"{side}-Elbow: UNRELIABLE ({reason_str})", (0, 80, 255))
+def format_joint_pair_status(group_name: str, left_key: str, right_key: str, joint_results):
+    """Build a compact (text, bgr_color) line for a Left/Right joint pair."""
+    l_angle, l_rel = joint_results[left_key]
+    r_angle, r_rel = joint_results[right_key]
+
+    def fmt_one(side: str, angle, rel) -> str:
+        if rel.is_reliable and angle is not None:
+            return f"{side}:{int(round(angle))}deg"
+        reason = rel.reasons[0] if rel.reasons else "hidden"
+        return f"{side}:HIDDEN({reason})"
+
+    both_ok = (l_rel.is_reliable and l_angle is not None) and (
+        r_rel.is_reliable and r_angle is not None
+    )
+    either_ok = (l_rel.is_reliable and l_angle is not None) or (
+        r_rel.is_reliable and r_angle is not None
+    )
+    color = (0, 255, 0) if both_ok else ((0, 200, 255) if either_ok else (0, 80, 255))
+    return (f"{group_name}: {fmt_one('L', l_angle, l_rel)} | {fmt_one('R', r_angle, r_rel)}", color)
 
 
-def draw_debug_panel(frame, pose, elbow_results) -> None:
-    """Draw a semi-transparent HUD showing arm visibilities and overlap status."""
+def draw_debug_panel(frame, pose, joint_results) -> None:
+    """Draw a semi-transparent HUD showing visibilities and joint reliability."""
     l_sh, l_el, l_wr = get_joint_visibilities(pose, LEFT_ELBOW_JOINT)
     r_sh, r_el, r_wr = get_joint_visibilities(pose, RIGHT_ELBOW_JOINT)
-
-    l_angle, l_rel = elbow_results["L"]
-    r_angle, r_rel = elbow_results["R"]
+    l_hip, l_kn, l_ank = get_joint_visibilities(pose, LEFT_KNEE_JOINT)
+    r_hip, r_kn, r_ank = get_joint_visibilities(pose, RIGHT_KNEE_JOINT)
 
     lines = [
         ("DEBUG [D: toggle]  L=Blue  R=Orange  Hollow=Vis<0.5", (230, 230, 230)),
         (
-            f"L Arm (11/13/15) Vis: Sh={format_vis(l_sh)}  El={format_vis(l_el)}  Wr={format_vis(l_wr)}",
+            f"L Vis: Sh={format_vis(l_sh)} El={format_vis(l_el)} Wr={format_vis(l_wr)} | Hip={format_vis(l_hip)} Kn={format_vis(l_kn)} Ank={format_vis(l_ank)}",
             COLOR_LEFT,
         ),
         (
-            f"R Arm (12/14/16) Vis: Sh={format_vis(r_sh)}  El={format_vis(r_el)}  Wr={format_vis(r_wr)}",
+            f"R Vis: Sh={format_vis(r_sh)} El={format_vis(r_el)} Wr={format_vis(r_wr)} | Hip={format_vis(r_hip)} Kn={format_vis(r_kn)} Ank={format_vis(r_ank)}",
             COLOR_RIGHT,
         ),
-        (
-            f"2D Dist: Sh={int(l_rel.shoulder_dist_px)}px  El={int(l_rel.elbow_dist_px)}px",
-            (200, 200, 200),
-        ),
-        format_elbow_status("L", l_angle, l_rel),
-        format_elbow_status("R", r_angle, r_rel),
+        format_joint_pair_status("Elbows", "L-Elb", "R-Elb", joint_results),
+        format_joint_pair_status("Hips  ", "L-Hip", "R-Hip", joint_results),
+        format_joint_pair_status("Knees ", "L-Knee", "R-Knee", joint_results),
     ]
 
     x0, y0 = 15, 55
-    panel_w = min(frame.shape[1] - 30, 500)
-    panel_h = 18 + len(lines) * 22
+    panel_w = min(frame.shape[1] - 30, 560)
+    panel_h = 18 + len(lines) * 20
 
     # Semi-transparent dark backdrop so debug text stays legible.
     overlay = frame.copy()
@@ -226,13 +233,57 @@ def draw_debug_panel(frame, pose, elbow_results) -> None:
         cv2.putText(
             frame,
             text,
-            (x0 + 10, y0 + 22 + i * 22),
+            (x0 + 8, y0 + 20 + i * 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.44,
             color,
             1,
             cv2.LINE_AA,
         )
+
+
+SQUAT_STAGE_COLORS = {
+    SquatStage.STANDING: (0, 220, 0),
+    SquatStage.DESCENDING: (0, 200, 255),
+    SquatStage.BOTTOM: (255, 220, 0),
+    SquatStage.ASCENDING: (120, 255, 100),
+    SquatStage.UNKNOWN: (180, 180, 180),
+}
+
+
+def draw_squat_stage_badge(frame, squat_result) -> None:
+    """Display the current squat movement stage in the top-right corner."""
+    height, width = frame.shape[:2]
+    text = f"Squat: {squat_result.stage.value}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.72
+    thickness = 2
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+
+    pad_x, pad_y = 14, 10
+    box_w = text_w + 2 * pad_x
+    box_h = text_h + baseline + 2 * pad_y
+    x1 = max(15, width - box_w - 15)
+    y1 = 12
+    x2 = min(width - 10, x1 + box_w)
+    y2 = min(height - 10, y1 + box_h)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+    color = SQUAT_STAGE_COLORS.get(squat_result.stage, (255, 255, 255))
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(
+        frame,
+        text,
+        (x1 + pad_x, y1 + pad_y + text_h),
+        font,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 # ---------------------------------------------------------------------------
 # 1. Load the MediaPipe Pose Landmarker Model
@@ -331,9 +382,11 @@ POSE_CONNECTION = [
 # Index 0 opens the default system webcam (use 1, 2, ... for external cameras).
 cap = cv2.VideoCapture(0)
 
-prev_time = 0                   # Timestamp of the previous frame (for FPS calculation)
-frame_timestamp_ms = 0          # Monotonically increasing timestamp required by VIDEO mode
+prev_time = 0                      # Timestamp of the previous frame (for FPS calculation)
+frame_timestamp_ms = 0             # Monotonically increasing timestamp required by VIDEO mode
 debug_side_view = DEBUG_SIDE_VIEW  # Live-toggleable side-view debug flag
+angle_smoother = AngleSmoother(alpha=0.45)  # Lightweight per-joint EMA smoother
+squat_detector = SquatStageDetector()       # Rule-based squat movement stage detector
 
 # Using try...finally guarantees hardware/native resources (webcam, MediaPipe,
 # OpenCV windows) are always released cleanly—even if an error occurs.
@@ -366,9 +419,16 @@ try:
         # -------------------------------------------------------------------
         # frame.shape is (height, width, channels); we only need height & width.
         height, width = frame.shape[:2]
+        curr_time = time.perf_counter()
 
         # `result.pose_landmarks` is a list of detected poses (up to `num_poses`).
-        if result.pose_landmarks:
+        if not result.pose_landmarks:
+            # Reset all smoothed values immediately when pose tracking is lost
+            # so stale angles are never carried over when tracking resumes.
+            angle_smoother.reset_all()
+            squat_result = squat_detector.update(None, None, None, None, curr_time)
+        else:
+            squat_result = None
             for pose in result.pose_landmarks:
                 # Draw skeleton lines connecting landmark pairs.
                 for start_idx, end_idx in POSE_CONNECTION:
@@ -401,51 +461,21 @@ try:
                     cv2.circle(frame, (x, y), 5, color, thickness)
 
                 # Track placed label rectangles each frame to prevent overlaps
-                # (reserve the top-left FPS text region first).
-                placed_boxes = [(15, 10, 155, 48)]
+                # (reserve FPS, top-right squat stage badge, and optional debug HUD).
+                placed_boxes = [
+                    (15, 10, 155, 48),
+                    (max(15, width - 275), 10, width - 10, 62),
+                ]
                 if debug_side_view:
-                    debug_w = min(width - 30, 500)
-                    debug_h = 18 + 6 * 22
+                    debug_w = min(width - 30, 560)
+                    debug_h = 18 + 6 * 20
                     placed_boxes.append((15, 55, 15 + debug_w, 55 + debug_h))
 
-                # Calculate and display both Left (11-13-15) and Right (12-14-16)
-                # elbow angles using the shared angle & reliability helpers.
-                elbow_results = {}
-                for side, joint_triplet, opposite_triplet, align_right in ELBOW_JOINTS:
-                    elbow_data = get_joint_angle(
-                        pose,
-                        joint_triplet,
-                        width,
-                        height,
-                        min_visibility=0.5,
-                    )
-                    reliability = evaluate_elbow_reliability(
-                        pose,
-                        joint_triplet,
-                        opposite_triplet,
-                        width,
-                        height,
-                        min_visibility=0.5,
-                    )
-                    angle = elbow_data[0] if elbow_data is not None else None
-                    elbow_results[side] = (angle, reliability)
-
-                    if elbow_data is not None and (reliability.is_reliable or debug_side_view):
-                        _, elbow_px = elbow_data
-                        suffix = "" if reliability.is_reliable else " (!)"
-                        label = f"{side}-Elb: {int(round(angle))} deg{suffix}"
-                        draw_angle_label(
-                            frame,
-                            label,
-                            elbow_px,
-                            reliability.is_reliable,
-                            align_right,
-                            placed_boxes,
-                        )
-
-                # Calculate and display Left/Right Hip (11-23-25, 12-24-26) and
-                # Left/Right Knee (23-25-27, 24-26-28) angles via `get_joint_angle()`.
-                for label_prefix, joint_triplet, align_right in LOWER_BODY_JOINTS:
+                # Evaluate, smooth, and display all tracked joints (elbows, hips, knees).
+                # Unreliable measurements are hidden and their smoother state is reset
+                # so stale values are never displayed after occlusion or tracking loss.
+                joint_results = {}
+                for label_prefix, joint_triplet, opposite_triplet, align_right in TRACKED_JOINTS:
                     joint_data = get_joint_angle(
                         pose,
                         joint_triplet,
@@ -453,9 +483,21 @@ try:
                         height,
                         min_visibility=0.5,
                     )
-                    if joint_data is not None:
-                        joint_angle, joint_px = joint_data
-                        label = f"{label_prefix}: {int(round(joint_angle))} deg"
+                    reliability = evaluate_joint_reliability(
+                        pose,
+                        joint_triplet,
+                        opposite_triplet,
+                        width,
+                        height,
+                        min_visibility=0.5,
+                    )
+
+                    if joint_data is not None and reliability.is_reliable:
+                        raw_angle, joint_px = joint_data
+                        smoothed_angle = angle_smoother.update(label_prefix, raw_angle)
+                        joint_results[label_prefix] = (smoothed_angle, reliability)
+
+                        label = f"{label_prefix}: {int(round(smoothed_angle))} deg"
                         draw_angle_label(
                             frame,
                             label,
@@ -464,16 +506,30 @@ try:
                             align_right,
                             placed_boxes,
                         )
+                    else:
+                        angle_smoother.reset(label_prefix)
+                        joint_results[label_prefix] = (None, reliability)
+
+                # Update Squat Stage Detector using ONLY reliable smoothed knee/hip angles.
+                squat_result = squat_detector.update(
+                    left_knee=joint_results["L-Knee"][0],
+                    right_knee=joint_results["R-Knee"][0],
+                    left_hip=joint_results["L-Hip"][0],
+                    right_hip=joint_results["R-Hip"][0],
+                    timestamp_sec=curr_time,
+                )
 
                 if debug_side_view:
-                    draw_debug_panel(frame, pose, elbow_results)
+                    draw_debug_panel(frame, pose, joint_results)
+
+        if squat_result is not None:
+            draw_squat_stage_badge(frame, squat_result)
 
         # -------------------------------------------------------------------
         # 5. Calculate & Display FPS (Frames Per Second)
         # -------------------------------------------------------------------
         # perf_counter() is a high-resolution monotonic timer ideal for measuring
         # elapsed frame time: FPS = 1 / (seconds elapsed since previous frame).
-        curr_time = time.perf_counter()
         delta = curr_time - prev_time
         fps = 1 / delta if prev_time > 0 and delta > 0 else 0
         prev_time = curr_time
