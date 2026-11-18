@@ -12,5 +12,41 @@ base_options = python.BaseOptions(
     model_asset_path=str(model_path)
 )
 options = vision.PoseLandmarkerOptions(
-    base_options=base_options
+    base_options=base_options,
+    running_mode=vision.RunningMode.VIDEO,
+    num_poses=1,
+    min_pose_detection_confidence=0.5,
+    min_pose_presence_confidence=0.5,
+    min_tracking_confidence=0.5,
 )
+
+pose_landmarker = vision.PoseLandmarker.create_from_options(options)
+
+# Webcam setup
+cap = cv2.VideoCapture(0)
+
+# Main processing loop
+
+prev_time = 0
+frame_timestamp_ms = 0
+
+try:
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open webcam")
+
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+
+        frame = cv2.flip(frame,1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        cv2.imshow("Pose Landmarker (Task API)", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+finally:
+    cap.release()
+    pose_landmarker.close()
+    cv2.destroyAllWindows()
+
