@@ -20,7 +20,9 @@ from mediapipe.tasks.python import vision
 
 from angles import (
     LEFT_ELBOW_JOINT,
+    LEFT_KNEE_JOINT,
     RIGHT_ELBOW_JOINT,
+    RIGHT_KNEE_JOINT,
     evaluate_elbow_reliability,
     get_joint_angle,
     get_joint_visibilities,
@@ -61,10 +63,16 @@ def get_connection_color(start_idx: int, end_idx: int, debug_mode: bool):
     return COLOR_CENTER
 
 
-# Elbow configurations: (short_label, joint_triplet, opposite_triplet, text_x_offset)
+# Elbow configurations: (short_label, joint_triplet, opposite_triplet, align_right_of_joint)
 ELBOW_JOINTS = (
-    ("L", LEFT_ELBOW_JOINT, RIGHT_ELBOW_JOINT, 12),
-    ("R", RIGHT_ELBOW_JOINT, LEFT_ELBOW_JOINT, -125),
+    ("L", LEFT_ELBOW_JOINT, RIGHT_ELBOW_JOINT, True),
+    ("R", RIGHT_ELBOW_JOINT, LEFT_ELBOW_JOINT, False),
+)
+
+# Knee configurations: (short_label, joint_triplet, align_right_of_joint)
+KNEE_JOINTS = (
+    ("L", LEFT_KNEE_JOINT, True),
+    ("R", RIGHT_KNEE_JOINT, False),
 )
 
 
@@ -73,33 +81,96 @@ def format_vis(value) -> str:
     return f"{value:.2f}" if value is not None else "N/A"
 
 
-def draw_angle_label(frame, text: str, vertex_px, is_reliable: bool, x_offset: int) -> None:
-    """Draw outlined angle text near a joint vertex, clamped within frame bounds."""
+def boxes_overlap(box_a, box_b) -> bool:
+    """Return True if two (x1, y1, x2, y2) rectangles overlap."""
+    return not (
+        box_a[2] <= box_b[0]
+        or box_a[0] >= box_b[2]
+        or box_a[3] <= box_b[1]
+        or box_a[1] >= box_b[3]
+    )
+
+
+def draw_angle_label(
+    frame,
+    text: str,
+    vertex_px,
+    is_reliable: bool,
+    align_right: bool,
+    placed_boxes,
+) -> None:
+    """
+    Draw outlined angle text beside a joint vertex while preventing labels
+    from going outside the frame or overlapping previously placed labels.
+    """
     height, width = frame.shape[:2]
     vx, vy = vertex_px
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    text_thickness = 2
+    outline_thickness = 4
+    margin = 10
+    joint_gap = 12
+    box_pad = 4
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
+    min_x = margin
+    max_x = max(margin, width - text_w - margin)
+    min_y = text_h + margin
+    max_y = max(min_y, height - baseline - margin)
+
+    def make_box(tx: int, ty: int):
+        return (tx - box_pad, ty - text_h - box_pad, tx + text_w + box_pad, ty + baseline + box_pad)
+
+    # Prefer the outer side of the joint first, then fall back to the opposite side.
+    x_candidates = (
+        (vx + joint_gap, vx - text_w - joint_gap)
+        if align_right
+        else (vx - text_w - joint_gap, vx + joint_gap)
+    )
+    y_step = text_h + baseline + 10
+    y_offsets = (0, y_step, -y_step, 2 * y_step, -2 * y_step, 3 * y_step, -3 * y_step)
+
+    chosen_x = max(min_x, min(x_candidates[0], max_x))
+    chosen_y = max(min_y, min(vy - 8, max_y))
+    chosen_box = make_box(chosen_x, chosen_y)
+
+    found_free_spot = False
+    for raw_x in x_candidates:
+        cand_x = max(min_x, min(raw_x, max_x))
+        for dy in y_offsets:
+            cand_y = max(min_y, min(vy - 8 + dy, max_y))
+            cand_box = make_box(cand_x, cand_y)
+            if not any(boxes_overlap(cand_box, other) for other in placed_boxes):
+                chosen_x, chosen_y, chosen_box = cand_x, cand_y, cand_box
+                found_free_spot = True
+                break
+        if found_free_spot:
+            break
+
+    placed_boxes.append(chosen_box)
     text_color = (255, 255, 255) if is_reliable else (0, 140, 255)
-    text_x = max(10, min(vx + x_offset, width - 155))
-    text_y = max(30, min(vy - 10, height - 10))
 
     # Draw a black outline behind text for readability on any background.
     cv2.putText(
         frame,
         text,
-        (text_x, text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        (chosen_x, chosen_y),
+        font,
+        font_scale,
         (0, 0, 0),
-        4,
+        outline_thickness,
         cv2.LINE_AA,
     )
     cv2.putText(
         frame,
         text,
-        (text_x, text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        (chosen_x, chosen_y),
+        font,
+        font_scale,
         text_color,
-        2,
+        text_thickness,
         cv2.LINE_AA,
     )
 
@@ -325,10 +396,18 @@ try:
                     thickness = 1 if (debug_side_view and (vis is None or vis < 0.5)) else -1
                     cv2.circle(frame, (x, y), 5, color, thickness)
 
+                # Track placed label rectangles each frame to prevent overlaps
+                # (reserve the top-left FPS text region first).
+                placed_boxes = [(15, 10, 155, 48)]
+                if debug_side_view:
+                    debug_w = min(width - 30, 500)
+                    debug_h = 18 + 6 * 22
+                    placed_boxes.append((15, 55, 15 + debug_w, 55 + debug_h))
+
                 # Calculate and display both Left (11-13-15) and Right (12-14-16)
                 # elbow angles using the shared angle & reliability helpers.
                 elbow_results = {}
-                for side, joint_triplet, opposite_triplet, x_offset in ELBOW_JOINTS:
+                for side, joint_triplet, opposite_triplet, align_right in ELBOW_JOINTS:
                     elbow_data = get_joint_angle(
                         pose,
                         joint_triplet,
@@ -350,8 +429,37 @@ try:
                     if elbow_data is not None and (reliability.is_reliable or debug_side_view):
                         _, elbow_px = elbow_data
                         suffix = "" if reliability.is_reliable else " (!)"
-                        label = f"{side}: {int(round(angle))} deg{suffix}"
-                        draw_angle_label(frame, label, elbow_px, reliability.is_reliable, x_offset)
+                        label = f"{side}-Elb: {int(round(angle))} deg{suffix}"
+                        draw_angle_label(
+                            frame,
+                            label,
+                            elbow_px,
+                            reliability.is_reliable,
+                            align_right,
+                            placed_boxes,
+                        )
+
+                # Calculate and display both Left (23-25-27) and Right (24-26-28)
+                # knee angles using the shared `get_joint_angle()` helper.
+                for side, joint_triplet, align_right in KNEE_JOINTS:
+                    knee_data = get_joint_angle(
+                        pose,
+                        joint_triplet,
+                        width,
+                        height,
+                        min_visibility=0.5,
+                    )
+                    if knee_data is not None:
+                        knee_angle, knee_px = knee_data
+                        label = f"{side}-Knee: {int(round(knee_angle))} deg"
+                        draw_angle_label(
+                            frame,
+                            label,
+                            knee_px,
+                            True,
+                            align_right,
+                            placed_boxes,
+                        )
 
                 if debug_side_view:
                     draw_debug_panel(frame, pose, elbow_results)
