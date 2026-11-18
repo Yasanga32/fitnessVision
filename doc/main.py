@@ -18,7 +18,146 @@ import mediapipe as mp            # MediaPipe core (used for mp.Image)
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from angles import LEFT_ELBOW_JOINT, get_joint_angle
+from angles import (
+    LEFT_ELBOW_JOINT,
+    RIGHT_ELBOW_JOINT,
+    evaluate_elbow_reliability,
+    get_joint_angle,
+    get_joint_visibilities,
+)
+
+# Temporary debug flag for side-view overlap investigation (press 'D' to toggle live)
+DEBUG_SIDE_VIEW = True
+
+# MediaPipe Pose left/right landmark index sets (index 0 = nose/center)
+LEFT_LANDMARKS = {1, 2, 3, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31}
+RIGHT_LANDMARKS = {4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32}
+
+# Distinct BGR colors used in side-view debug mode
+COLOR_LEFT = (255, 140, 0)      # Blue (MediaPipe Left side)
+COLOR_RIGHT = (0, 110, 255)     # Orange (MediaPipe Right side)
+COLOR_CENTER = (220, 220, 220)  # Light gray (center / cross-body connections)
+
+
+def get_landmark_color(index: int, debug_mode: bool):
+    """Return BGR color for a landmark (side-coded in debug mode, green normally)."""
+    if not debug_mode:
+        return (0, 255, 0)
+    if index in LEFT_LANDMARKS:
+        return COLOR_LEFT
+    if index in RIGHT_LANDMARKS:
+        return COLOR_RIGHT
+    return COLOR_CENTER
+
+
+def get_connection_color(start_idx: int, end_idx: int, debug_mode: bool):
+    """Return BGR color for a skeleton bone (side-coded in debug mode, cyan normally)."""
+    if not debug_mode:
+        return (255, 255, 0)
+    if start_idx in LEFT_LANDMARKS and end_idx in LEFT_LANDMARKS:
+        return COLOR_LEFT
+    if start_idx in RIGHT_LANDMARKS and end_idx in RIGHT_LANDMARKS:
+        return COLOR_RIGHT
+    return COLOR_CENTER
+
+
+# Elbow configurations: (short_label, joint_triplet, opposite_triplet, text_x_offset)
+ELBOW_JOINTS = (
+    ("L", LEFT_ELBOW_JOINT, RIGHT_ELBOW_JOINT, 12),
+    ("R", RIGHT_ELBOW_JOINT, LEFT_ELBOW_JOINT, -125),
+)
+
+
+def format_vis(value) -> str:
+    """Format a landmark visibility score cleanly for the debug overlay."""
+    return f"{value:.2f}" if value is not None else "N/A"
+
+
+def draw_angle_label(frame, text: str, vertex_px, is_reliable: bool, x_offset: int) -> None:
+    """Draw outlined angle text near a joint vertex, clamped within frame bounds."""
+    height, width = frame.shape[:2]
+    vx, vy = vertex_px
+    text_color = (255, 255, 255) if is_reliable else (0, 140, 255)
+    text_x = max(10, min(vx + x_offset, width - 155))
+    text_y = max(30, min(vy - 10, height - 10))
+
+    # Draw a black outline behind text for readability on any background.
+    cv2.putText(
+        frame,
+        text,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        text,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        text_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def format_elbow_status(side: str, angle, reliability):
+    """Build a (text, bgr_color) tuple for one elbow in the debug HUD."""
+    if reliability.is_reliable and angle is not None:
+        return (f"{side}-Elbow: RELIABLE ({int(round(angle))} deg)", (0, 255, 0))
+    reason_str = ", ".join(reliability.reasons) if reliability.reasons else "unavailable"
+    return (f"{side}-Elbow: UNRELIABLE ({reason_str})", (0, 80, 255))
+
+
+def draw_debug_panel(frame, pose, elbow_results) -> None:
+    """Draw a semi-transparent HUD showing arm visibilities and overlap status."""
+    l_sh, l_el, l_wr = get_joint_visibilities(pose, LEFT_ELBOW_JOINT)
+    r_sh, r_el, r_wr = get_joint_visibilities(pose, RIGHT_ELBOW_JOINT)
+
+    l_angle, l_rel = elbow_results["L"]
+    r_angle, r_rel = elbow_results["R"]
+
+    lines = [
+        ("DEBUG [D: toggle]  L=Blue  R=Orange  Hollow=Vis<0.5", (230, 230, 230)),
+        (
+            f"L Arm (11/13/15) Vis: Sh={format_vis(l_sh)}  El={format_vis(l_el)}  Wr={format_vis(l_wr)}",
+            COLOR_LEFT,
+        ),
+        (
+            f"R Arm (12/14/16) Vis: Sh={format_vis(r_sh)}  El={format_vis(r_el)}  Wr={format_vis(r_wr)}",
+            COLOR_RIGHT,
+        ),
+        (
+            f"2D Dist: Sh={int(l_rel.shoulder_dist_px)}px  El={int(l_rel.elbow_dist_px)}px",
+            (200, 200, 200),
+        ),
+        format_elbow_status("L", l_angle, l_rel),
+        format_elbow_status("R", r_angle, r_rel),
+    ]
+
+    x0, y0 = 15, 55
+    panel_w = min(frame.shape[1] - 30, 500)
+    panel_h = 18 + len(lines) * 22
+
+    # Semi-transparent dark backdrop so debug text stays legible.
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+    for i, (text, color) in enumerate(lines):
+        cv2.putText(
+            frame,
+            text,
+            (x0 + 10, y0 + 22 + i * 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
 # ---------------------------------------------------------------------------
 # 1. Load the MediaPipe Pose Landmarker Model
@@ -117,8 +256,9 @@ POSE_CONNECTION = [
 # Index 0 opens the default system webcam (use 1, 2, ... for external cameras).
 cap = cv2.VideoCapture(0)
 
-prev_time = 0           # Timestamp of the previous frame (for FPS calculation)
-frame_timestamp_ms = 0  # Monotonically increasing timestamp required by VIDEO mode
+prev_time = 0                   # Timestamp of the previous frame (for FPS calculation)
+frame_timestamp_ms = 0          # Monotonically increasing timestamp required by VIDEO mode
+debug_side_view = DEBUG_SIDE_VIEW  # Live-toggleable side-view debug flag
 
 # Using try...finally guarantees hardware/native resources (webcam, MediaPipe,
 # OpenCV windows) are always released cleanly—even if an error occurs.
@@ -155,15 +295,6 @@ try:
         # `result.pose_landmarks` is a list of detected poses (up to `num_poses`).
         if result.pose_landmarks:
             for pose in result.pose_landmarks:
-                # Draw a filled green dot on each of the 33 landmarks.
-                for landmark in pose:
-                    # Landmarks are normalized to [0.0, 1.0] relative to image size,
-                    # so multiply by width/height to get pixel coordinates.
-                    x = int(landmark.x * width)
-                    y = int(landmark.y * height)
-                    # Note: OpenCV colors are BGR -> (0, 255, 0) = green; -1 = filled.
-                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
-
                 # Draw skeleton lines connecting landmark pairs.
                 for start_idx, end_idx in POSE_CONNECTION:
                     start = pose[start_idx]
@@ -180,45 +311,50 @@ try:
                     x1, y1 = int(start.x * width), int(start.y * height)
                     x2, y2 = int(end.x * width), int(end.y * height)
 
-                    # BGR (255, 255, 0) = cyan, line thickness = 2 px.
-                    cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                    line_color = get_connection_color(start_idx, end_idx, debug_side_view)
+                    cv2.line(frame, (x1, y1), (x2, y2), line_color, 2)
 
-                # Calculate and display the Left Elbow angle (landmarks 11 -> 13 -> 15)
-                # only when shoulder, elbow, and wrist all meet the visibility threshold.
-                elbow_data = get_joint_angle(
-                    pose,
-                    LEFT_ELBOW_JOINT,
-                    width,
-                    height,
-                    min_visibility=0.5,
-                )
-                if elbow_data is not None:
-                    left_elbow_angle, (elbow_x, elbow_y) = elbow_data
-                    label = f"{int(round(left_elbow_angle))} deg"
-                    text_x = max(10, min(elbow_x + 12, width - 110))
-                    text_y = max(30, min(elbow_y - 10, height - 10))
+                # Draw each of the 33 landmarks (side-colored in debug mode, green normally).
+                # In debug mode, landmarks with visibility < 0.5 are drawn hollow so
+                # occluded far-side points stand out clearly from visible near-side ones.
+                for idx, landmark in enumerate(pose):
+                    x = int(landmark.x * width)
+                    y = int(landmark.y * height)
+                    color = get_landmark_color(idx, debug_side_view)
+                    vis = getattr(landmark, "visibility", None)
+                    thickness = 1 if (debug_side_view and (vis is None or vis < 0.5)) else -1
+                    cv2.circle(frame, (x, y), 5, color, thickness)
 
-                    # Draw a black outline behind white text for readability on any background.
-                    cv2.putText(
-                        frame,
-                        label,
-                        (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 0, 0),
-                        4,
-                        cv2.LINE_AA,
+                # Calculate and display both Left (11-13-15) and Right (12-14-16)
+                # elbow angles using the shared angle & reliability helpers.
+                elbow_results = {}
+                for side, joint_triplet, opposite_triplet, x_offset in ELBOW_JOINTS:
+                    elbow_data = get_joint_angle(
+                        pose,
+                        joint_triplet,
+                        width,
+                        height,
+                        min_visibility=0.5,
                     )
-                    cv2.putText(
-                        frame,
-                        label,
-                        (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
+                    reliability = evaluate_elbow_reliability(
+                        pose,
+                        joint_triplet,
+                        opposite_triplet,
+                        width,
+                        height,
+                        min_visibility=0.5,
                     )
+                    angle = elbow_data[0] if elbow_data is not None else None
+                    elbow_results[side] = (angle, reliability)
+
+                    if elbow_data is not None and (reliability.is_reliable or debug_side_view):
+                        _, elbow_px = elbow_data
+                        suffix = "" if reliability.is_reliable else " (!)"
+                        label = f"{side}: {int(round(angle))} deg{suffix}"
+                        draw_angle_label(frame, label, elbow_px, reliability.is_reliable, x_offset)
+
+                if debug_side_view:
+                    draw_debug_panel(frame, pose, elbow_results)
 
         # -------------------------------------------------------------------
         # 5. Calculate & Display FPS (Frames Per Second)
@@ -245,9 +381,13 @@ try:
         cv2.imshow("Pose Landmarker (Task API)", frame)
 
         # waitKey(1) refreshes the window and waits 1 ms for a key press.
-        # `& 0xFF` keeps the lowest 8 bits (standard ASCII code); 27 = Esc key.
-        if cv2.waitKey(1) & 0xFF == 27:
+        # `& 0xFF` keeps the lowest 8 bits (standard ASCII code):
+        #   27 = Esc (quit), 'd'/'D' = toggle side-view debug visualization.
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
             break
+        elif key in (ord("d"), ord("D")):
+            debug_side_view = not debug_side_view
 finally:
     # Always free the webcam, close MediaPipe's native resources, and close windows.
     cap.release()
