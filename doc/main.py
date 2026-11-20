@@ -30,6 +30,7 @@ from angles import (
     get_joint_visibilities,
 )
 from smoothing import AngleSmoother
+from squat_counter import SquatRepCounter
 from squat_stage import SquatStage, SquatStageDetector
 
 # Temporary debug flag for side-view overlap investigation (press 'D' to toggle live)
@@ -206,7 +207,7 @@ def draw_debug_panel(frame, pose, joint_results) -> None:
     r_hip, r_kn, r_ank = get_joint_visibilities(pose, RIGHT_KNEE_JOINT)
 
     lines = [
-        ("DEBUG [D: toggle]  L=Blue  R=Orange  Hollow=Vis<0.5", (230, 230, 230)),
+        ("DEBUG [D: toggle | R: reset reps]  L=Blue  R=Orange  Hollow=Vis<0.5", (230, 230, 230)),
         (
             f"L Vis: Sh={format_vis(l_sh)} El={format_vis(l_el)} Wr={format_vis(l_wr)} | Hip={format_vis(l_hip)} Kn={format_vis(l_kn)} Ank={format_vis(l_ank)}",
             COLOR_LEFT,
@@ -251,18 +252,23 @@ SQUAT_STAGE_COLORS = {
 }
 
 
-def draw_squat_stage_badge(frame, squat_result) -> None:
-    """Display the current squat movement stage in the top-right corner."""
+def draw_squat_dashboard(frame, squat_result, counter_result) -> None:
+    """Display current squat movement stage and repetition count in the top-right."""
     height, width = frame.shape[:2]
-    text = f"Squat: {squat_result.stage.value}"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.72
-    thickness = 2
-    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    stage_text = f"Squat: {squat_result.stage.value}"
+    reps_text = f"Reps: {counter_result.reps}"
+    hint_text = "[R] Reset"
 
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (stage_w, stage_h), _ = cv2.getTextSize(stage_text, font, 0.68, 2)
+    (reps_w, reps_h), _ = cv2.getTextSize(reps_text, font, 0.82, 2)
+    (hint_w, hint_h), _ = cv2.getTextSize(hint_text, font, 0.38, 1)
+
+    max_text_w = max(stage_w, reps_w + hint_w + 16)
     pad_x, pad_y = 14, 10
-    box_w = text_w + 2 * pad_x
-    box_h = text_h + baseline + 2 * pad_y
+    box_w = max_text_w + 2 * pad_x
+    box_h = stage_h + reps_h + 3 * pad_y + 4
+
     x1 = max(15, width - box_w - 15)
     y1 = 12
     x2 = min(width - 10, x1 + box_w)
@@ -270,18 +276,43 @@ def draw_squat_stage_badge(frame, squat_result) -> None:
 
     overlay = frame.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
 
-    color = SQUAT_STAGE_COLORS.get(squat_result.stage, (255, 255, 255))
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    stage_color = SQUAT_STAGE_COLORS.get(squat_result.stage, (255, 255, 255))
+    cv2.rectangle(frame, (x1, y1), (x2, y2), stage_color, 2)
+
+    # Line 1: Squat Stage
     cv2.putText(
         frame,
-        text,
-        (x1 + pad_x, y1 + pad_y + text_h),
+        stage_text,
+        (x1 + pad_x, y1 + pad_y + stage_h),
         font,
-        scale,
-        color,
-        thickness,
+        0.68,
+        stage_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Line 2: Reps count (prominent) + Reset hint
+    reps_baseline_y = y1 + pad_y + stage_h + pad_y + reps_h + 2
+    cv2.putText(
+        frame,
+        reps_text,
+        (x1 + pad_x, reps_baseline_y),
+        font,
+        0.82,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        hint_text,
+        (x1 + pad_x + reps_w + 16, reps_baseline_y - 2),
+        font,
+        0.38,
+        (170, 170, 170),
+        1,
         cv2.LINE_AA,
     )
 
@@ -387,6 +418,7 @@ frame_timestamp_ms = 0             # Monotonically increasing timestamp required
 debug_side_view = DEBUG_SIDE_VIEW  # Live-toggleable side-view debug flag
 angle_smoother = AngleSmoother(alpha=0.45)  # Lightweight per-joint EMA smoother
 squat_detector = SquatStageDetector()       # Rule-based squat movement stage detector
+squat_counter = SquatRepCounter()           # Sequential squat repetition counter
 
 # Using try...finally guarantees hardware/native resources (webcam, MediaPipe,
 # OpenCV windows) are always released cleanly—even if an error occurs.
@@ -427,8 +459,10 @@ try:
             # so stale angles are never carried over when tracking resumes.
             angle_smoother.reset_all()
             squat_result = squat_detector.update(None, None, None, None, curr_time)
+            counter_result = squat_counter.update(squat_result)
         else:
             squat_result = None
+            counter_result = None
             for pose in result.pose_landmarks:
                 # Draw skeleton lines connecting landmark pairs.
                 for start_idx, end_idx in POSE_CONNECTION:
@@ -461,10 +495,10 @@ try:
                     cv2.circle(frame, (x, y), 5, color, thickness)
 
                 # Track placed label rectangles each frame to prevent overlaps
-                # (reserve FPS, top-right squat stage badge, and optional debug HUD).
+                # (reserve FPS, top-right squat dashboard, and optional debug HUD).
                 placed_boxes = [
                     (15, 10, 155, 48),
-                    (max(15, width - 275), 10, width - 10, 62),
+                    (max(15, width - 290), 10, width - 10, 105),
                 ]
                 if debug_side_view:
                     debug_w = min(width - 30, 560)
@@ -518,12 +552,13 @@ try:
                     right_hip=joint_results["R-Hip"][0],
                     timestamp_sec=curr_time,
                 )
+                counter_result = squat_counter.update(squat_result)
 
                 if debug_side_view:
                     draw_debug_panel(frame, pose, joint_results)
 
-        if squat_result is not None:
-            draw_squat_stage_badge(frame, squat_result)
+        if squat_result is not None and counter_result is not None:
+            draw_squat_dashboard(frame, squat_result, counter_result)
 
         # -------------------------------------------------------------------
         # 5. Calculate & Display FPS (Frames Per Second)
@@ -550,12 +585,14 @@ try:
 
         # waitKey(1) refreshes the window and waits 1 ms for a key press.
         # `& 0xFF` keeps the lowest 8 bits (standard ASCII code):
-        #   27 = Esc (quit), 'd'/'D' = toggle side-view debug visualization.
+        #   27 = Esc (quit), 'd'/'D' = toggle side-view debug, 'r'/'R' = reset reps.
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
         elif key in (ord("d"), ord("D")):
             debug_side_view = not debug_side_view
+        elif key in (ord("r"), ord("R")):
+            squat_counter.reset()
 finally:
     # Always free the webcam, close MediaPipe's native resources, and close windows.
     cap.release()
